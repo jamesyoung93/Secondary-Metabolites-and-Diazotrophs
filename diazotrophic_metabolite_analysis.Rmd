@@ -2,10 +2,7 @@
 title: "Secondary Metabolites Predict Diazotrophic Cyanobacteria"
 author: "James Young"
 date: "`r Sys.Date()`"
-output:
-  html_document:
-    df_print: paged
-  pdf_document: default
+output: html_document
 ---
 
 ```{r setup, include = FALSE}
@@ -46,10 +43,6 @@ theme_set(
 options(java.parameters = "-Xmx2g")  # plenty of heap for rcdk
 dir.create(here::here("results"), showWarnings = FALSE)
 ```
-
-
-
-
 
 
 ```{r}
@@ -104,15 +97,21 @@ mean(x3$FIX)
 ```{r}
 
 
-smiles2fp <- function(smiles_vec) {
+smiles2fp <- function(smiles_vec,
+                      depth = 30,        # was 6
+                      nbits = 262144) {
   mols <- rcdk::parse.smiles(smiles_vec)
   ok   <- !vapply(mols, is.null, logical(1))
-  if (!all(ok)) message(sum(!ok), " invalid SMILES dropped")
   mols <- mols[ok]
 
-  fp_set <- lapply(mols, rcdk::get.fingerprint,
-                   type = "standard", fp.mode = "bit")
-
+  fp_set <- lapply(
+    mols,
+    rcdk::get.fingerprint,
+    type     = "standard",   # path-based FP
+    fp.mode  = "bit",
+    depth    = depth,        # maximum bond-path length recorded
+    size     = nbits
+  )
   class(fp_set) <- "FPset"
   list(fp = fp_set, keep = ok)
 }
@@ -285,9 +284,7 @@ write_csv(unk, here::here("results", "AllUnknownPredictions2.csv"))
 
 ## ── Re‑compute unknown‑compound predictions (robust version) ───────────
 `%notin%` <- Negate(`%in%`)
-if (!exists("pred_u", inherits = FALSE)) {
 
-  message("Re‑computing unknown‑compound predictions …")
 
   all_smiles <- get_data("CyanoMetDB.csv") |>
                 distinct(SMILES, CompoundName, .keep_all = TRUE)
@@ -306,24 +303,26 @@ if (!exists("pred_u", inherits = FALSE)) {
     if (denom == 0) 0 else inter / denom
   }
 
-  pred_u <- purrr::map_dfr(seq_along(fp_q), function(i) {
+pred_u <- purrr::map_dfr(seq_along(fp_q), function(i) {
 
-    sims <- vapply(apset, function(fp)
-                   tanimoto(fp_q[[i]]@bits, fp@bits), numeric(1))
+  sims <- vapply(apset, function(fp)
+                 tanimoto(fp_q[[i]]@bits, fp@bits), numeric(1))
+  best <- which.max(sims)
 
-    best <- which.max(sims)                       # nearest neighbour
-
-    tibble(
-      FIX          = x3$FIX[best],
-      CompoundName = unknown$CompoundName[i],
-      score        = sims[best],
-      smiles       = unknown$SMILES[i],
-      pred         = ifelse(FIX == 1,
-                            0.5 + 0.5 * sims[best],
-                            0.5 - 0.5 * sims[best])
-    )
-  })
-}
+  tibble(
+    # neighbour identity
+    nn_name      = x3$name[best],
+    nn_smiles    = x3$smiles[best],
+    # existing output
+    FIX          = x3$FIX[best],
+    CompoundName = unknown$CompoundName[i],
+    score        = as.numeric(sims[best]),
+    smiles       = unknown$SMILES[i],
+    pred         = ifelse(FIX == 1,
+                          0.5 + 0.5 * as.numeric(sims[best]),
+                          0.5 - 0.5 * as.numeric(sims[best]))
+  )
+})
 
 ```
 
@@ -357,8 +356,11 @@ compound_tbl <- pred_u2 |>
          `Predicted Probability` = pred) #|>
   #slice_tail(n = 20)
 
-knitr::kable(strain_tbl, digits = 3, caption = "Top‑ranked strains")
-knitr::kable(compound_tbl, digits = 3, caption = "Top‑ranked compounds")
+compound_tbl <- pred_u2 |>
+  arrange(desc(pred))
+
+#knitr::kable(strain_tbl, digits = 3, caption = "Top‑ranked strains")
+#knitr::kable(compound_tbl, digits = 3, caption = "Top‑ranked compounds")
 
 write_csv(strain_tbl,   here::here("results", "UnlabeledStrainResults2.csv"))
 write_csv(compound_tbl, here::here("results", "UnlabeledCompoundResults2.csv"))
