@@ -1,0 +1,459 @@
+---
+title: "Secondary Metabolites Predict Diazotrophic Cyanobacteria"
+author: "James Young"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include = FALSE}
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Packages & global options
+# ─────────────────────────────────────────────────────────────────────────────
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  dpi        = 300,             # high‑resolution figs
+  fig.width  = 6,
+  fig.height = 5,
+  fig.retina = 2
+)
+
+required <- c(
+  "tidyverse", "here", "splitstackshape",
+  "rcdk", "fingerprint", "caret", "gains", "pROC",
+  "ggpubr", "patchwork"
+)
+to_install <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(required, library, character.only = TRUE))
+
+# large, bold default theme
+theme_set(
+  theme_bw(base_size = 16) +
+    theme(
+      plot.title  = element_text(hjust = 0.5, size = 18, face = "bold"),
+      axis.title  = element_text(size = 16, face = "bold"),
+      axis.text   = element_text(size = 14),
+      legend.text = element_text(size = 14)
+    )
+)
+
+options(java.parameters = "-Xmx2g")  # plenty of heap for rcdk
+dir.create(here::here("results"), showWarnings = FALSE)
+```
+
+
+
+
+
+
+```{r}
+gh_raw <- function(fname) {
+  glue::glue(
+    "https://raw.githubusercontent.com/jamesyoung93/Secondary-Metabolites-and-Diazotrophs/main/{fname}"
+  )
+}
+get_data <- function(fname) readr::read_csv(gh_raw(fname), show_col_types = FALSE)
+
+met_tbl <- get_data("Met.csv")
+cyano   <- get_data("CyanoMetDB.csv")
+
+# Keep strains with labelled diazotrophy (0 / 1) and valid names
+met_lbl <- met_tbl |> filter(Fix %in% c(0, 1))
+met_str <- semi_join(met_tbl, met_lbl, by = "Strain") |> filter(Strain != "n.a.")
+
+# Expand multi‑strain columns in CyanoMetDB
+cyano <- cyano |>
+  cSplit("Strain", sep = ";", direction = "long") |>
+  cSplit("Strain", sep = ",", direction = "long")
+
+cy_int <- semi_join(cyano, met_str, by = "Strain") |>
+  left_join(select(met_str, Strain, Fix), by = "Strain")
+
+x3 <- cy_int |>
+  #arrange(desc(Fix)) |>
+  #distinct(SMILES, .keep_all = TRUE) |>       # ← remove duplicate structures
+  select(CompoundName, Fix, SMILES) |>
+  rename(name = CompoundName, FIX = Fix, smiles = SMILES)
+
+x3 <- cy_int %>%                    # starting data-frame
+  add_count(SMILES, name = "n") %>% # n = frequency of each SMILES
+  filter(n == 1) %>%               # keep the uniques only
+  select(-n) %>%                   # drop helper column
+  select(CompoundName, Fix, SMILES) %>%
+  rename(name   = CompoundName,
+         FIX    = Fix,
+         smiles = SMILES)
+
+#x3[is.na(x3)] <- 0
+x3 <- x3 %>% filter(!is.na(FIX))
+mean(x3$FIX)
+```
+
+
+
+
+
+
+
+```{r}
+
+
+smiles2fp <- function(smiles_vec) {
+  mols <- rcdk::parse.smiles(smiles_vec)
+  ok   <- !vapply(mols, is.null, logical(1))
+  if (!all(ok)) message(sum(!ok), " invalid SMILES dropped")
+  mols <- mols[ok]
+
+  fp_set <- lapply(mols, rcdk::get.fingerprint,
+                   type = "standard", fp.mode = "bit")
+
+  class(fp_set) <- "FPset"
+  list(fp = fp_set, keep = ok)
+}
+
+
+
+
+# one‑against‑all Tanimoto similarity (manual; no S4 coercion problems)
+cmp_nn <- function(fp_set, i, cutoff = 0.01) {
+  targ  <- fp_set[[i]]@bits
+  tanim <- function(bits) {
+    inter <- length(intersect(targ, bits))
+    denom <- length(targ) + length(bits) - inter
+    if (denom == 0) 0 else inter / denom
+  }
+  sims <- vapply(fp_set, function(fp) tanim(fp@bits), numeric(1))
+  sims[i] <- -1
+  best    <- which.max(sims)
+  if (sims[best] < cutoff) best <- which.max(sims)  # ensure a neighbour
+  list(idx = best, score = sims[best])
+}
+```
+
+
+
+
+```{r}
+fp_res <- smiles2fp(x3$smiles)
+apset  <- fp_res$fp
+x3     <- x3[fp_res$keep, ]
+
+pred_df <- map_dfr(seq_len(nrow(x3)), function(i) {
+  nn <- cmp_nn(apset, i, cutoff = 0.01)
+  tibble(
+    nn_fix  = x3$FIX[nn$idx],
+    selfFix = x3$FIX[i],
+    score   = nn$score
+  )
+})
+
+# probability scale (0.0 – 1.0)
+pred_df <- pred_df |>
+  mutate(prob = if_else(
+    nn_fix == 1,
+    0.5 + 0.5 * score,
+    0.5 - 0.5 * score
+  ))
+
+```
+
+
+
+```{r}
+cm <- caret::confusionMatrix(
+  factor(pred_df$nn_fix,  levels = c(0, 1)),
+  factor(pred_df$selfFix, levels = c(0, 1))
+)
+
+# ggplot‑style confusion matrix
+cm_tbl <- as_tibble(cm$table, .name_repair = "unique") |>
+  rename(Predicted = 1, Actual = 2, n = 3)
+
+gg_cm <- ggplot(cm_tbl, aes(Actual, Predicted, fill = n)) +
+  geom_tile(color = "black", linewidth = 1.2) +
+  geom_text(aes(label = n),
+            size = 6, fontface = "bold", colour = "white") +
+  scale_fill_gradient(low = "#F7AD50", high = "#3F97D0") +
+  labs(title = "Confusion Matrix",
+       x = "Actual class",
+       y = "Predicted class") +
+  theme(legend.position = "none")
+gg_cm
+ggsave(here::here("results", "confusion_matrix.png"),
+       gg_cm, width = 6, height = 4, dpi = 300)
+```
+
+
+
+```{r roc, fig.height = 4, fig.width = 5.5}
+## 6  ROC curve (panel B)  — fixed drawing order
+library(pROC)
+roc_obj <- roc(pred_df$selfFix, pred_df$prob, quiet = TRUE)
+auc_val <- auc(roc_obj)
+
+roc_df <- tibble(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+) |>
+  arrange(fpr, tpr)          # ensure proper order
+
+gg_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_step(linewidth = 1) +                          # heavier curve
+  geom_abline(linetype = "dashed") +
+  coord_equal(expand = FALSE) +
+  labs(title = "Structural Similarity Model",
+       x = "False positive rate",
+       y = "True positive rate") +
+  theme_bw(base_size = 16) +
+  theme(
+    axis.line.y.left = element_blank(),               # ← remove clash
+    panel.border     = element_blank(),               # keep frame clean
+    axis.ticks       = element_line(size = 1),
+    axis.text        = element_text(face = "bold"),
+    axis.title       = element_text(face = "bold"),
+    plot.title       = element_text(hjust = 0.5,
+                                    face = "bold",
+                                    size = 20)
+  ) +
+  annotate("text", x = 0.6, y = 0.12,
+           label = sprintf("LOOCV AUC = %.2f", auc_val),
+           size = 6, fontface = "bold")
+
+
+gg_roc
+ggsave(here::here("results", "roc_curve_step.png"),
+       gg_roc, width = 5.5, height = 5, dpi = 300)
+```
+
+
+```{r}
+g_tab <- gains(pred_df$selfFix, pred_df$prob, groups = 20)
+plot(g_tab$depth, g_tab$cume.lift, type = "l", lwd = 3,
+     ylab = "Cumulative lift", xlab = "Rank bucket",
+     main = "Lift & Response")
+par(new = TRUE)
+plot(g_tab$depth, g_tab$cume.pct.of.total, type = "l", col = "red",
+     axes = FALSE, xlab = "", ylab = "")
+axis(side = 4)
+mtext("Cumulative response", side = 4, col = "red", line = 3)
+legend("right", legend = c("Lift", "Response"),
+       lwd = 3, col = c("black", "red"), bty = "n")
+```
+
+
+
+
+
+
+
+```{r}
+all_raw <- get_data("CyanoMetDB.csv") |> distinct(CompoundName, SMILES)
+fp_all  <- smiles2fp(all_raw$SMILES)
+fps_all <- fp_all$fp
+all_df  <- all_raw[fp_all$keep, ]
+
+unk <- map_dfr(seq_along(fps_all), function(i) {
+  sims <- map_dbl(apset, ~{
+    inter <- length(intersect(.x@bits, fps_all[[i]]@bits))
+    denom <- length(.x@bits) + length(fps_all[[i]]@bits) - inter
+    if (denom == 0) 0 else inter / denom
+  })
+  best <- which.max(sims)
+  tibble(
+    nn_fix  = x3$FIX[best],
+    CompoundName = all_df$CompoundName[i],
+    score   = sims[best]
+  )
+}) |>
+  mutate(pred_prob = if_else(
+    nn_fix == 1, 0.5 + 0.5 * score, 0.5 - 0.5 * score
+  ))
+
+write_csv(unk, here::here("results", "AllUnknownPredictions2.csv"))
+```
+
+
+
+
+```{r}
+
+## ── Re‑compute unknown‑compound predictions (robust version) ───────────
+`%notin%` <- Negate(`%in%`)
+if (!exists("pred_u", inherits = FALSE)) {
+
+  message("Re‑computing unknown‑compound predictions …")
+
+  all_smiles <- get_data("CyanoMetDB.csv") |>
+                distinct(SMILES, CompoundName, .keep_all = TRUE)
+
+  unknown_all <- filter(all_smiles, SMILES %notin% x3$smiles)
+
+  # build fingerprints *once*; keep mask says which SMILES parsed OK
+  fp_u <- smiles2fp(unknown_all$SMILES)
+  unknown <- unknown_all[ fp_u$keep, ]            # drop unparsable rows
+  fp_q    <- fp_u$fp                              # list of query FPs
+
+  ## ---- helper: fast Tanimoto on bit‑vector indices --------------------
+  tanimoto <- function(b1, b2) {
+    inter <- length(intersect(b1, b2))
+    denom <- length(b1) + length(b2) - inter
+    if (denom == 0) 0 else inter / denom
+  }
+
+  pred_u <- purrr::map_dfr(seq_along(fp_q), function(i) {
+
+    sims <- vapply(apset, function(fp)
+                   tanimoto(fp_q[[i]]@bits, fp@bits), numeric(1))
+
+    best <- which.max(sims)                       # nearest neighbour
+
+    tibble(
+      FIX          = x3$FIX[best],
+      CompoundName = unknown$CompoundName[i],
+      score        = sims[best],
+      smiles       = unknown$SMILES[i],
+      pred         = ifelse(FIX == 1,
+                            0.5 + 0.5 * sims[best],
+                            0.5 - 0.5 * sims[best])
+    )
+  })
+}
+
+```
+
+
+
+
+
+
+```{r}
+
+pred_u2 <- pred_u %>% filter(pred_u$smiles %notin% unique(x3$SMILES))
+pred_u2$SMILES<- pred_u2$smiles
+strain_tbl <- cyano |>
+  cSplit("Strain", sep = ";", direction = "long") |>
+  cSplit("Strain", sep = ",", direction = "long") |>
+  inner_join(select(pred_u2, SMILES, pred),
+             by = c("SMILES")) |>
+  group_by(Strain) |>
+  summarise(
+    `Max Probability` = max(pred),
+    `Metabolite Count` = n(), .groups = "drop"
+  ) |>
+  arrange(desc(`Max Probability`)) #|>
+  #slice_tail(n = 20)
+
+#hist(strain_tbl$`Max Probability`)
+
+compound_tbl <- pred_u2 |>
+  arrange(desc(pred)) |>
+  select(`Compound Name` = CompoundName,
+         `Predicted Probability` = pred) #|>
+  #slice_tail(n = 20)
+
+knitr::kable(strain_tbl, digits = 3, caption = "Top‑ranked strains")
+knitr::kable(compound_tbl, digits = 3, caption = "Top‑ranked compounds")
+
+write_csv(strain_tbl,   here::here("results", "UnlabeledStrainResults2.csv"))
+write_csv(compound_tbl, here::here("results", "UnlabeledCompoundResults2.csv"))
+```
+
+```{r}
+## ── Toxicity box‑plots with wrapped y‑axis titles ──────────────────────
+tox_rat  <- get_data("Batch_Oral_rat_LD50_Consensus.csv")
+tox_daph <- get_data("Batch_Daphnia_magna_LC50_(48_hr)_AllMethods.csv")
+
+## classification lookup (labelled + unknown predictions we just made)
+pred_lookup <- bind_rows(
+  transmute(x3,  smiles, p_np = FIX),
+  transmute(unk, smiles = CompoundName,  # unknowns use their names
+            p_np = if_else(pred_prob >= .5, 1, 0))
+)
+
+make_box <- function(dat, ycol, ylab, lookup, label_y) {
+  joined <- dat |>
+    mutate(smiles = Query) |>
+    left_join(lookup, by = "smiles") |>
+    filter(!is.na(p_np)) |>
+    rename(value = !!ycol) |>
+    mutate(value = suppressWarnings(as.numeric(value))) |>
+    filter(!is.na(value))
+
+  joined$p_np <- factor(joined$p_np, levels = c(0, 1))
+
+  ggpubr::ggboxplot(
+    joined, x = "p_np", y = "value",
+    palette = "jco", add = "jitter",
+    size = 1.1, ggtheme = theme_bw(base_size = 16)
+  ) +
+    ggpubr::stat_compare_means(method  = "t.test",
+                               label.y = label_y,
+                               size    = 4.5,
+                               label.x.npc = .5) +
+    coord_cartesian(ylim = c(0, 10), clip = "off") +
+    labs(x = "Diazotroph (1)\nvs Non‑diazotroph (0)",
+         y = ylab) +
+    theme(
+      axis.title.x = element_text(vjust = -2.6, hjust = .5, face = "bold"),
+      axis.title.y = element_text(face = "bold",
+                                  margin = margin(r = 7)),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(colour = "grey85", linewidth = .4),
+      panel.grid.minor   = element_blank(),
+      plot.margin        = margin(t = 22, r = 20, b = 46, l = 22)
+    )
+}
+
+p1 <- make_box(
+  tox_rat,
+  "Pred_Value:_-Log10(mol/kg)",
+  "Rat oral LD50\n(−log10 mol kg⁻¹)",
+  pred_lookup,
+  label_y = 8.9
+)
+
+p2 <- make_box(
+  tox_daph,
+  "Pred_Consensus_-Log10(mol/L)",
+  "Daphnia LC50\n(−log10 mol L⁻¹)",
+  pred_lookup,
+  label_y = 8.9
+)
+
+tox_plot <- (p1 | p2) +
+  patchwork::plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag          = element_text(size = 16, face = "bold"),
+      plot.tag.position = c(.012, .983)
+    )
+  )
+
+tox_plot   # show in viewer
+
+## save (note the **ggplot2** namespace)
+ggplot2::ggsave(
+  here::here("results", "toxicity_boxplots.png"),
+  tox_plot,
+  width  = 9,
+  height = 4,
+  dpi    = 300
+)
+
+```
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
