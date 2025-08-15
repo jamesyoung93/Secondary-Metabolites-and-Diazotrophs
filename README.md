@@ -23,11 +23,7 @@ To reproduce the analysis on your machine, download this repository, open the `d
 rmarkdown::render("diazotrophic_metabolite_analysis.Rmd")
 ```
 
-## Run online via Posit Cloud
 
-If you prefer not to install anything locally, the entire project can be executed in Posit Cloud. After signing in with a free Posit account, open the following workspace and run the R Markdown file there:
-
-<https://posit.cloud/content/10552080>
 
 ## Example results
 
