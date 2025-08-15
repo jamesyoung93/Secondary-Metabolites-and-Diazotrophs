@@ -1,0 +1,1183 @@
+---
+title: "Secondary Metabolites Predict Diazotrophic Cyanobacteria"
+author: "James Young"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  Packages & global options
+# ──────────────────────────────────────────────────────────────────────────────
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  dpi        = 300,             # high-resolution figs
+  fig.width  = 6,
+  fig.height = 5,
+  fig.retina = 2
+)
+
+required <- c(
+  "tidyverse", "here", "splitstackshape",
+  "rcdk", "fingerprint", "caret", "gains", "pROC",
+  "ggpubr", "patchwork"
+)
+to_install <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(required, library, character.only = TRUE))
+
+# large, bold default theme
+theme_set(
+  theme_bw(base_size = 16) +
+    theme(
+      plot.title  = element_text(hjust = 0.5, size = 18, face = "bold"),
+      axis.title  = element_text(size = 16, face = "bold"),
+      axis.text   = element_text(size = 14),
+      legend.text = element_text(size = 14)
+    )
+)
+
+options(java.parameters = "-Xmx2g")  # plenty of heap for rcdk
+dir.create(here::here("results"), showWarnings = FALSE)
+```
+
+
+```{r}
+gh_raw <- function(fname) {
+  glue::glue(
+    "https://raw.githubusercontent.com/jamesyoung93/Secondary-Metabolites-and-Diazotrophs/main/{fname}"
+  )
+}
+get_data <- function(fname) readr::read_csv(gh_raw(fname), show_col_types = FALSE)
+
+met_tbl <- get_data("Met.csv")
+cyano   <- get_data("CyanoMetDB.csv")
+
+# Keep strains with labelled diazotrophy (0 / 1) and valid names
+met_lbl <- met_tbl |> filter(Fix %in% c(0, 1))
+met_str <- semi_join(met_tbl, met_lbl, by = "Strain") |> filter(Strain != "n.a.")
+
+# Expand multi-strain columns in CyanoMetDB
+cyano <- cyano |>
+  cSplit("Strain", sep = ";", direction = "long") |>
+  cSplit("Strain", sep = ",", direction = "long")
+
+cy_int <- semi_join(cyano, met_str, by = "Strain") |>
+  left_join(select(met_str, Strain, Fix), by = "Strain")
+
+# Filter for unique SMILES strings with known Fix status
+x3 <- cy_int %>%                    
+  add_count(SMILES, name = "n") %>% 
+  filter(n == 1) %>%               
+  select(-n) %>%                   
+  select(CompoundName, Fix, SMILES) %>%
+  rename(name   = CompoundName,
+         FIX    = Fix,
+         smiles = SMILES) %>%
+  filter(!is.na(FIX))
+
+mean(x3$FIX)
+```
+
+```{r}
+# If you have issues with plotting, uncomment the code below and run
+# graphics.off()  # Close all graphics devices
+# dev.new() 
+```
+
+
+```{r}
+smiles2fp <- function(smiles_vec,
+                      depth = 30,        
+                      nbits = 262144) {
+  mols <- rcdk::parse.smiles(smiles_vec)
+  ok   <- !vapply(mols, is.null, logical(1))
+  mols <- mols[ok]
+
+  fp_set <- lapply(
+    mols,
+    rcdk::get.fingerprint,
+    type     = "standard",   # path-based FP
+    fp.mode  = "bit",
+    depth    = depth,        # maximum bond-path length recorded
+    size     = nbits
+  )
+  class(fp_set) <- "FPset"
+  list(fp = fp_set, keep = ok)
+}
+
+# One-against-all Tanimoto similarity (manual; no S4 coercion problems)
+cmp_nn <- function(fp_set, i, cutoff = 0.01) {
+  targ  <- fp_set[[i]]@bits
+  tanim <- function(bits) {
+    inter <- length(intersect(targ, bits))
+    denom <- length(targ) + length(bits) - inter
+    if (denom == 0) 0 else inter / denom
+  }
+  sims <- vapply(fp_set, function(fp) tanim(fp@bits), numeric(1))
+  sims[i] <- -1
+  best    <- which.max(sims)
+  if (sims[best] < cutoff) best <- which.max(sims)  # ensure a neighbour
+  list(idx = best, score = sims[best])
+}
+```
+
+
+```{r}
+fp_res <- smiles2fp(x3$smiles)
+apset  <- fp_res$fp
+x3     <- x3[fp_res$keep, ]
+
+pred_df <- map_dfr(seq_len(nrow(x3)), function(i) {
+  nn <- cmp_nn(apset, i, cutoff = 0.01)
+  tibble(
+    nn_fix  = x3$FIX[nn$idx],
+    selfFix = x3$FIX[i],
+    score   = nn$score
+  )
+})
+
+# probability scale (0.0 - 1.0)
+pred_df <- pred_df |>
+  mutate(prob = if_else(
+    nn_fix == 1,
+    0.5 + 0.5 * score,
+    0.5 - 0.5 * score
+  ))
+```
+
+
+```{r}
+cm <- caret::confusionMatrix(
+  factor(pred_df$nn_fix,  levels = c(0, 1)),
+  factor(pred_df$selfFix, levels = c(0, 1))
+)
+
+# ggplot-style confusion matrix
+cm_tbl <- as_tibble(cm$table, .name_repair = "unique") |>
+  rename(Predicted = 1, Actual = 2, n = 3)
+
+gg_cm <- ggplot(cm_tbl, aes(Actual, Predicted, fill = n)) +
+  geom_tile(color = "black", linewidth = 1.2) +
+  geom_text(aes(label = n),
+            size = 6, fontface = "bold", colour = "white") +
+  scale_fill_gradient(low = "#F7AD50", high = "#3F97D0") +
+  labs(title = "Confusion Matrix",
+       x = "Actual class",
+       y = "Predicted class") +
+  theme(legend.position = "none")
+gg_cm
+ggsave(here::here("results", "confusion_matrix.png"),
+       gg_cm, width = 6, height = 4, dpi = 300)
+```
+
+
+```{r roc, fig.height = 4, fig.width = 5.5}
+## ROC curve (panel B) - fixed drawing order
+library(pROC)
+roc_obj <- roc(pred_df$selfFix, pred_df$prob, quiet = TRUE)
+auc_val <- auc(roc_obj)
+
+roc_df <- tibble(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+) |>
+  arrange(fpr, tpr)          # ensure proper order
+
+gg_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_step(linewidth = 1) +                          # heavier curve
+  geom_abline(linetype = "dashed") +
+  coord_equal(expand = FALSE) +
+  labs(title = "Structural Similarity Model",
+       x = "False positive rate",
+       y = "True positive rate") +
+  theme_bw(base_size = 16) +
+  theme(
+    axis.line.y.left = element_blank(),               
+    panel.border     = element_blank(),               
+    axis.ticks       = element_line(size = 1),
+    axis.text        = element_text(face = "bold"),
+    axis.title       = element_text(face = "bold"),
+    plot.title       = element_text(hjust = 0.5,
+                                    face = "bold",
+                                    size = 20)
+  ) +
+  annotate("text", x = 0.6, y = 0.12,
+           label = sprintf("LOOCV AUC = %.2f", auc_val),
+           size = 6, fontface = "bold")
+
+gg_roc
+ggsave(here::here("results", "roc_curve_step.png"),
+       gg_roc, width = 5.5, height = 5, dpi = 300)
+```
+
+
+```{r}
+g_tab <- gains(pred_df$selfFix, pred_df$prob, groups = 20)
+plot(g_tab$depth, g_tab$cume.lift, type = "l", lwd = 3,
+     ylab = "Cumulative lift", xlab = "Rank bucket",
+     main = "Lift & Response")
+par(new = TRUE)
+plot(g_tab$depth, g_tab$cume.pct.of.total, type = "l", col = "red",
+     axes = FALSE, xlab = "", ylab = "")
+axis(side = 4)
+mtext("Cumulative response", side = 4, col = "red", line = 3)
+legend("right", legend = c("Lift", "Response"),
+       lwd = 3, col = c("black", "red"), bty = "n")
+```
+
+
+```{r}
+all_raw <- get_data("CyanoMetDB.csv") |> distinct(CompoundName, SMILES)
+fp_all  <- smiles2fp(all_raw$SMILES)
+fps_all <- fp_all$fp
+all_df  <- all_raw[fp_all$keep, ]
+
+unk <- map_dfr(seq_along(fps_all), function(i) {
+  sims <- map_dbl(apset, ~{
+    inter <- length(intersect(.x@bits, fps_all[[i]]@bits))
+    denom <- length(.x@bits) + length(fps_all[[i]]@bits) - inter
+    if (denom == 0) 0 else inter / denom
+  })
+  best <- which.max(sims)
+  tibble(
+    nn_fix  = x3$FIX[best],
+    CompoundName = all_df$CompoundName[i],
+    score   = sims[best]
+  )
+}) |>
+  mutate(pred_prob = if_else(
+    nn_fix == 1, 0.5 + 0.5 * score, 0.5 - 0.5 * score
+  ))
+
+write_csv(unk, here::here("results", "AllUnknownPredictions2.csv"))
+```
+
+
+```{r}
+## Re-compute unknown-compound predictions (robust version)
+`%notin%` <- Negate(`%in%`)
+
+all_smiles <- get_data("CyanoMetDB.csv") |>
+              distinct(SMILES, CompoundName, .keep_all = TRUE)
+
+unknown_all <- filter(all_smiles, SMILES %notin% x3$smiles)
+
+# build fingerprints *once*; keep mask says which SMILES parsed OK
+fp_u <- smiles2fp(unknown_all$SMILES)
+unknown <- unknown_all[ fp_u$keep, ]            # drop unparsable rows
+fp_q    <- fp_u$fp                              # list of query FPs
+
+## Helper: fast Tanimoto on bit-vector indices
+tanimoto <- function(b1, b2) {
+  inter <- length(intersect(b1, b2))
+  denom <- length(b1) + length(b2) - inter
+  if (denom == 0) 0 else inter / denom
+}
+
+pred_u <- purrr::map_dfr(seq_along(fp_q), function(i) {
+  sims <- vapply(apset, function(fp)
+                 tanimoto(fp_q[[i]]@bits, fp@bits), numeric(1))
+  best <- which.max(sims)
+
+  tibble(
+    # neighbour identity
+    nn_name      = x3$name[best],
+    nn_smiles    = x3$smiles[best],
+    # existing output
+    FIX          = x3$FIX[best],
+    CompoundName = unknown$CompoundName[i],
+    score        = as.numeric(sims[best]),
+    smiles       = unknown$SMILES[i],
+    pred         = ifelse(FIX == 1,
+                          0.5 + 0.5 * as.numeric(sims[best]),
+                          0.5 - 0.5 * as.numeric(sims[best]))
+  )
+})
+```
+
+
+```{r}
+pred_u2 <- pred_u %>% filter(pred_u$smiles %notin% unique(x3$SMILES))
+pred_u2$SMILES<- pred_u2$smiles
+strain_tbl <- cyano |>
+  cSplit("Strain", sep = ";", direction = "long") |>
+  cSplit("Strain", sep = ",", direction = "long") |>
+  inner_join(select(pred_u2, SMILES, pred),
+             by = c("SMILES")) |>
+  group_by(Strain) |>
+  summarise(
+    `Max Probability` = max(pred),
+    `Metabolite Count` = n(), .groups = "drop"
+  ) |>
+  arrange(desc(`Max Probability`))
+
+compound_tbl <- pred_u2 |>
+  arrange(desc(pred)) |>
+  select(`Compound Name` = CompoundName,
+         `Predicted Probability` = pred)
+
+compound_tbl <- pred_u2 |>
+  arrange(desc(pred))
+
+write_csv(strain_tbl,   here::here("results", "UnlabeledStrainResults2.csv"))
+write_csv(compound_tbl, here::here("results", "UnlabeledCompoundResults2.csv"))
+```
+
+```{r}
+## Toxicity box-plots with wrapped y-axis titles
+tox_rat  <- get_data("Batch_Oral_rat_LD50_Consensus.csv")
+tox_daph <- get_data("Batch_Daphnia_magna_LC50_(48_hr)_AllMethods.csv")
+
+## classification lookup (labelled + unknown predictions we just made)
+pred_lookup <- bind_rows(
+  transmute(x3,  smiles, p_np = FIX),
+  transmute(unk, smiles = CompoundName,  # unknowns use their names
+            p_np = if_else(pred_prob >= .5, 1, 0))
+)
+
+make_box <- function(dat, ycol, ylab, lookup, label_y) {
+  joined <- dat |>
+    mutate(smiles = Query) |>
+    left_join(lookup, by = "smiles") |>
+    filter(!is.na(p_np)) |>
+    rename(value = !!ycol) |>
+    mutate(value = suppressWarnings(as.numeric(value))) |>
+    filter(!is.na(value))
+
+  joined$p_np <- factor(joined$p_np, levels = c(0, 1))
+
+  ggpubr::ggboxplot(
+    joined, x = "p_np", y = "value",
+    palette = "jco", add = "jitter",
+    size = 1.1, ggtheme = theme_bw(base_size = 16)
+  ) +
+    ggpubr::stat_compare_means(method  = "t.test",
+                               label.y = label_y,
+                               size    = 4.5,
+                               label.x.npc = .5) +
+    coord_cartesian(ylim = c(0, 10), clip = "off") +
+    labs(x = "Diazotroph (1)\nvs Non-diazotroph (0)",
+         y = ylab) +
+    theme(
+      axis.title.x = element_text(vjust = -2.6, hjust = .5, face = "bold"),
+      axis.title.y = element_text(face = "bold",
+                                  margin = margin(r = 7)),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(colour = "grey85", linewidth = .4),
+      panel.grid.minor   = element_blank(),
+      plot.margin        = margin(t = 22, r = 20, b = 46, l = 22)
+    )
+}
+
+p1 <- make_box(
+  tox_rat,
+  "Pred_Value:_-Log10(mol/kg)",
+  "Rat oral LD50\n(-log10 mol kg-1)",
+  pred_lookup,
+  label_y = 8.9
+)
+
+p2 <- make_box(
+  tox_daph,
+  "Pred_Consensus_-Log10(mol/L)",
+  "Daphnia LC50\n(-log10 mol L-1)",
+  pred_lookup,
+  label_y = 8.9
+)
+
+tox_plot <- (p1 | p2) +
+  patchwork::plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag          = element_text(size = 16, face = "bold"),
+      plot.tag.position = c(.012, .983)
+    )
+  )
+
+tox_plot   # show in viewer
+
+## save
+ggplot2::ggsave(
+  here::here("results", "toxicity_boxplots.png"),
+  tox_plot,
+  width  = 9,
+  height = 4,
+  dpi    = 300
+)
+```
+
+
+```{r fingerprint_comparison, message=FALSE, warning=FALSE}
+# ──────────────────────────────────────────────────────────────────────────────
+# Evaluate multiple fingerprint approaches using 10x10-fold CV
+# This generates Table 1 from the manuscript
+# ──────────────────────────────────────────────────────────────────────────────
+
+library(rcdk)
+library(caret)
+library(yardstick)
+library(purrr)
+library(tibble)
+library(dplyr)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. Safe fingerprint builder (returns NULL on Java error)
+# ──────────────────────────────────────────────────────────────────────────────
+safe_smiles2fp <- function(smiles_vec,
+                           type  = "standard",
+                           depth = NA,
+                           nbits = 4096) {
+
+  mols <- rcdk::parse.smiles(smiles_vec)
+  ok   <- !vapply(mols, is.null, logical(1))
+
+  fp_list <- tryCatch(
+    {
+      lapply(mols[ok], function(mol) {
+        if (is.na(depth))
+          rcdk::get.fingerprint(mol, type = type,
+                                 fp.mode = "bit", size = nbits)
+        else
+          rcdk::get.fingerprint(mol, type = type, depth = depth,
+                                 fp.mode = "bit", size = nbits)
+      })
+    },
+    error = function(e) {
+      message(sprintf("  **Skipping '%s'** - %s",
+                      type, conditionMessage(e)))
+      return(NULL)
+    }
+  )
+
+  if (is.null(fp_list)) return(NULL)
+
+  ok_fp <- !vapply(fp_list, is.null, logical(1))
+  keep  <- rep(FALSE, length(smiles_vec))
+  keep[which(ok)[ok_fp]] <- TRUE
+  class(fp_list) <- "FPset"
+  list(fp = fp_list[ok_fp], keep = keep)
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. 1-NN evaluation function with 10x10-fold CV
+# ──────────────────────────────────────────────────────────────────────────────
+eval_fp <- function(fp_type, pretty,
+                    depth = NA, nbits = 4096,
+                    n_repeat = 10, n_fold = 10) {
+
+  # Build fingerprints
+  fp_res <- safe_smiles2fp(x3$smiles,
+                           type  = fp_type,
+                           depth = depth,
+                           nbits = nbits)
+  if (is.null(fp_res)) return(NULL)
+
+  fps    <- fp_res$fp
+  dat    <- x3[fp_res$keep, ]
+  n_tot  <- nrow(dat)
+  if (n_tot < 4 || min(table(dat$FIX)) < 2) return(NULL)
+
+  # Helper: predict one compound via 1-NN
+  tanimoto <- function(b1, b2){
+    inter <- length(intersect(b1, b2))
+    denom <- length(b1) + length(b2) - inter
+    if (denom == 0) 0 else inter / denom
+  }
+  
+  one_pred <- function(i, train_idx){
+    sims <- vapply(train_idx, function(j)
+                   tanimoto(fps[[i]]@bits, fps[[j]]@bits), 0.0)
+    nn    <- train_idx[which.max(sims)]
+    cls   <- dat$FIX[nn]
+    prob  <- if (cls == 1) 0.5 + 0.5*max(sims) else 0.5 - 0.5*max(sims)
+    list(class = cls, prob = prob)
+  }
+
+  # Repeated CV
+  metric_mat <- matrix(NA_real_, nrow = n_repeat, ncol = 5,
+                       dimnames = list(NULL, c("Acc","Prec","Re","F1","AUC")))
+  auc_vec <- numeric(n_repeat)
+
+  set.seed(2025)
+  for (r in seq_len(n_repeat)){
+    folds <- caret::createFolds(dat$FIX, k = n_fold)
+    preds <- purrr::map_dfr(folds, function(test_idx){
+      train_idx <- setdiff(seq_len(n_tot), test_idx)
+      pr <- purrr::map(test_idx, one_pred, train_idx)
+      tibble(
+        obs  = dat$FIX[test_idx],
+        pred = purrr::map_int(pr, "class"),
+        prob = purrr::map_dbl(pr, "prob")
+      )
+    })
+
+    truth <- factor(preds$obs,  levels = c(0,1))
+    pred  <- factor(preds$pred, levels = c(0,1))
+
+    metric_mat[r,"Acc"]  <- accuracy_vec(truth, pred)
+    metric_mat[r,"Prec"] <- precision_vec(truth, pred, event_level = "second")
+    metric_mat[r,"Re"]   <- recall_vec(truth, pred,    event_level = "second")
+    metric_mat[r,"F1"]   <- f_meas_vec(truth, pred,    event_level = "second")
+    metric_mat[r,"AUC"]  <- roc_auc_vec(truth, preds$prob, 
+                                        event_level = "second")
+    auc_vec[r] <- metric_mat[r,"AUC"]
+  }
+
+  # Calculate mean ± 95% CI
+  n_rep   <- n_repeat
+  alpha   <- 0.95
+  t_mult  <- qt((1 + alpha)/2, df = n_rep - 1)
+
+  means   <- colMeans(metric_mat)
+  ses     <- apply(metric_mat, 2, sd) / sqrt(n_rep)
+  ci_low  <- means - t_mult * ses
+  ci_high <- means + t_mult * ses
+
+  # Significance test for AUC > 0.5
+  p_auc <- t.test(auc_vec, mu = 0.5, alternative = "greater")$p.value
+
+  # Return results
+  tibble(
+    Fingerprint = pretty,
+    Accuracy  = sprintf("%.3f (%.3f-%.3f)", means["Acc"],  ci_low["Acc"],  ci_high["Acc"]),
+    Precision = sprintf("%.3f (%.3f-%.3f)", means["Prec"], ci_low["Prec"], ci_high["Prec"]),
+    Recall    = sprintf("%.3f (%.3f-%.3f)", means["Re"],   ci_low["Re"],   ci_high["Re"]),
+    F1        = sprintf("%.3f (%.3f-%.3f)", means["F1"],   ci_low["F1"],   ci_high["F1"]),
+    AUC       = sprintf("%.3f (%.3f-%.3f)", means["AUC"],  ci_low["AUC"],  ci_high["AUC"]),
+    n_compounds = n_tot,
+    p_AUC_gt_0.5 = signif(p_auc, 3)
+  )
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Define fingerprint grid (matching Table 1 from manuscript)
+# ──────────────────────────────────────────────────────────────────────────────
+fp_grid <- tribble(
+  ~fp_type,  ~pretty,                          ~depth, ~nbits,
+  # manuscript default
+  "standard", "Path-based d30 262k (paper)",    30,    262144,
+  # alternatives
+  "extended", "Extended d15 262k",              15,    262144,
+  "pubchem",  "PubChem (881 bits)",             NA,    881,
+  "graph",    "Graph 4k",                       NA,    4096,
+  "maccs",    "MACCS 166",                      NA,    166
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Run benchmark
+# ──────────────────────────────────────────────────────────────────────────────
+message("Running 10x10-fold CV for multiple fingerprint approaches...")
+message("This may take a few minutes...")
+
+perf_tbl <- fp_grid %>%
+  mutate(res = pmap(list(fp_type, pretty, depth, nbits),
+                    \(fp_type, pretty, depth, nbits)
+                      eval_fp(fp_type, pretty, depth, nbits))) %>%
+  filter(!map_lgl(res, is.null)) %>%
+  unnest(res) %>%
+  arrange(desc(as.numeric(sub(" .*","", Accuracy))))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. Display results as Table 1
+# ──────────────────────────────────────────────────────────────────────────────
+knitr::kable(
+  perf_tbl %>% select(-n_compounds),
+  align = c("l", rep("c", ncol(perf_tbl)-2)),
+  caption = "Table 1. Multiple fingerprint approaches evaluated using repeated 10-fold CV (10 repeats). Values show mean (95% CI). The path-based d30 262k fingerprint is used throughout the main manuscript. All approaches show significantly better than random AUC (p < 0.05, one-sided t-test)."
+)
+
+# Save the table for supplemental materials
+write_csv(perf_tbl, "fingerprint_comparison_table.csv")
+```
+
+
+
+
+```{r}
+# ──────────────────────────────────────────────────────────────────────────────
+# Figure 2: Multi-panel structural descriptor and clustering analysis
+# This code should be added after the fingerprint comparison section
+# ──────────────────────────────────────────────────────────────────────────────
+
+## Load required packages for Figure 2
+library(tidyverse)
+library(forcats)
+library(ggrepel)
+library(patchwork)
+library(RColorBrewer)
+library(dynamicTreeCut)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 1: Define descriptor helper functions
+# ──────────────────────────────────────────────────────────────────────────────
+count_N         <- function(s) str_count(s, "N")
+count_O         <- function(s) str_count(s, "O")
+count_ClBr      <- function(s) str_count(s, "Cl|Br")
+count_C         <- function(s) str_count(s, "C")
+ring_digits     <- function(s) str_count(s, "[0-9]") / 2
+amide_bonds     <- function(s) str_count(s, "C\\(=O\\)N")
+carbox_count    <- function(s) str_count(s, "C\\(=O\\)O")
+sulfur_cnt      <- function(s) str_count(s, "S")
+dbe_est         <- function(s) { 
+  C <- str_count(s, "C")
+  H <- str_count(s, "H")
+  if (C == 0) NA else C - H/2 + 1 
+}
+
+# Define descriptor columns to use
+descriptor_cols <- c("ClBr_atoms", "AliphaticC", "N_atoms", "O_atoms",
+                     "RingDigits", "HeteroRatio", "AmideBonds",
+                     "CarboxylCount", "DBE")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 2: Calculate descriptors for known compounds
+# ──────────────────────────────────────────────────────────────────────────────
+known_df <- x3 %>%
+  mutate(
+    ClBr_atoms    = map_int(smiles, count_ClBr),
+    AliphaticC    = map_dbl(smiles, function(s) {
+                      totC <- count_C(s)
+                      alC  <- totC - str_count(s, "c")
+                      ifelse(totC == 0, 0, alC / totC)
+                    }),
+    N_atoms       = map_int(smiles, count_N),
+    O_atoms       = map_int(smiles, count_O),
+    RingDigits    = map_dbl(smiles, ring_digits),
+    HeteroRatio   = (N_atoms + O_atoms + map_int(smiles, sulfur_cnt)) /
+                      pmax(count_C(smiles), 1),
+    AmideBonds    = map_int(smiles, amide_bonds),
+    CarboxylCount = map_int(smiles, carbox_count),
+    DBE           = map_dbl(smiles, dbe_est)
+  )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3: Perform hierarchical clustering and MDS
+# ──────────────────────────────────────────────────────────────────────────────
+# Calculate similarity matrix
+sim_matrix  <- fingerprint::fp.sim.matrix(apset, apset, method = "tanimoto")
+dist_matrix <- 1 - sim_matrix
+
+# Hierarchical clustering with dynamic tree cut
+hc <- hclust(as.dist(dist_matrix), method = "average")
+groups <- cutreeDynamic(hc,
+                        distM = as.matrix(dist_matrix),
+                        minClusterSize = 15,
+                        deepSplit = 0)
+
+# Convert noise (0) to cluster 6
+groups[groups == 0] <- 6
+known_df$Cluster <- factor(groups)
+
+# MDS projection
+mds_out <- cmdscale(as.dist(dist_matrix), k = 2)
+known_df$Dim1 <- mds_out[, 1]
+known_df$Dim2 <- mds_out[, 2]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 4: Process unknown compounds
+# ──────────────────────────────────────────────────────────────────────────────
+# Get all unlabeled compounds from CyanoMetDB
+all_raw <- get_data("CyanoMetDB.csv") %>% 
+  distinct(CompoundName, SMILES)
+
+# Build fingerprints for unknowns
+fp_all  <- smiles2fp(all_raw$SMILES)
+fps_all <- fp_all$fp
+all_df  <- all_raw[fp_all$keep, ]
+
+# Find nearest neighbor for each unknown
+unk <- map_dfr(seq_along(fps_all), function(i) {
+  sims <- map_dbl(apset, ~{
+    inter <- length(intersect(.x@bits, fps_all[[i]]@bits))
+    denom <- length(.x@bits) + length(fps_all[[i]]@bits) - inter
+    if (denom == 0) 0 else inter / denom
+  })
+  best <- which.max(sims)
+  tibble(
+    nn_idx = best,
+    nn_fix = x3$FIX[best],
+    CompoundName = all_df$CompoundName[i],
+    smiles = all_df$SMILES[i],
+    score = sims[best],
+    pred_prob = if_else(nn_fix == 1, 
+                        0.5 + 0.5 * score, 
+                        0.5 - 0.5 * score)
+  )
+})
+
+# Assign unknowns to clusters based on nearest neighbor
+unknown_df <- unk %>%
+  mutate(
+    Cluster = factor(groups[nn_idx]),
+    Distance = 1 - score,
+    ClBr_atoms    = map_int(smiles, count_ClBr),
+    AliphaticC    = map_dbl(smiles, function(s) {
+                      totC <- count_C(s)
+                      alC  <- totC - str_count(s, "c")
+                      ifelse(totC == 0, 0, alC / totC)
+                    }),
+    N_atoms       = map_int(smiles, count_N),
+    O_atoms       = map_int(smiles, count_O),
+    RingDigits    = map_dbl(smiles, ring_digits),
+    HeteroRatio   = (N_atoms + O_atoms + map_int(smiles, sulfur_cnt)) /
+                      pmax(count_C(smiles), 1),
+    AmideBonds    = map_int(smiles, amide_bonds),
+    CarboxylCount = map_int(smiles, carbox_count),
+    DBE           = map_dbl(smiles, dbe_est)
+  )
+
+unknown_df <- unknown_df %>%
+  distinct(CompoundName, smiles, .keep_all = TRUE)
+
+unknown_df <- unknown_df %>%
+  filter(!(CompoundName %in% known_df$name))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Panel A: Group-wise descriptor heatmap (FIX=0, FIX=1, Unknown)
+# ──────────────────────────────────────────────────────────────────────────────
+group_means <- bind_rows(
+  known_df %>% filter(FIX == 0) %>%
+    summarise(across(all_of(descriptor_cols), mean, na.rm = TRUE)) %>%
+    mutate(Group = "FIX=0"),
+  known_df %>% filter(FIX == 1) %>%
+    summarise(across(all_of(descriptor_cols), mean, na.rm = TRUE)) %>%
+    mutate(Group = "FIX=1"),
+  unknown_df %>%
+    summarise(across(all_of(descriptor_cols), mean, na.rm = TRUE)) %>%
+    mutate(Group = "Unknown")
+)
+
+group_long <- group_means %>%
+  pivot_longer(-Group, names_to = "Descriptor", values_to = "Mean") %>%
+  group_by(Descriptor) %>%
+  mutate(z = scale(Mean)[,1]) %>%
+  ungroup()
+
+z_lim <- max(abs(group_long$z))
+
+plotA <- ggplot(group_long,
+                aes(factor(Descriptor, levels = descriptor_cols),
+                    factor(Group, levels = c("Unknown", "FIX=1", "FIX=0")),
+                    fill = z)) +
+  geom_tile(colour = "grey90", linewidth = 0.2) +
+  scale_fill_gradient2(low = "navy", mid = "white", high = "firebrick",
+                       limits = c(-z_lim, z_lim), name = "Z-score") +
+  scale_y_discrete(labels = c(
+    sprintf("Unknown (n=%d)", nrow(unknown_df)),
+    sprintf("FIX=1 (n=%d)", sum(known_df$FIX == 1)),
+    sprintf("FIX=0 (n=%d)", sum(known_df$FIX == 0))
+  )) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(face = "bold"),
+        panel.grid = element_blank(),
+        legend.position = "bottom",
+        legend.key.width = unit(1.2, "cm"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Panel B: MDS plot with cluster labels
+# ──────────────────────────────────────────────────────────────────────────────
+valid_clusters <- sort(unique(known_df$Cluster))
+pal_clusters <- setNames(brewer.pal(length(valid_clusters), "Dark2"), 
+                         valid_clusters)
+
+centroids <- known_df %>%
+  group_by(Cluster) %>%
+  summarise(Dim1 = mean(Dim1), 
+            Dim2 = mean(Dim2),
+            n = n(), 
+            pctFIX = round(mean(FIX) * 100),
+            .groups = "drop") %>%
+  mutate(label = sprintf("Cl %s\n(n=%d, %%FIX=%d%%)", 
+                        Cluster, n, pctFIX))
+
+plotB <- ggplot(known_df, aes(Dim1, Dim2, colour = Cluster)) +
+  geom_point(alpha = 0.35, size = 3) +
+  geom_text_repel(data = centroids, 
+                  aes(label = label),
+                  seed = 1, 
+                  box.padding = 0.35, 
+                  min.segment.length = 0.1,
+                  size = 5, 
+                  fontface = "bold", 
+                  colour = "black",
+                  segment.color = NA) +
+  scale_colour_manual(values = pal_clusters, guide = "none") +
+  labs(x = "MDS Dim 1", y = "MDS Dim 2") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank(),
+        axis.title = element_text(face = "bold"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Panel C: Cluster-level descriptor heatmap
+# ──────────────────────────────────────────────────────────────────────────────
+clust_means <- known_df %>%
+  group_by(Cluster) %>%
+  summarise(across(all_of(descriptor_cols), mean, na.rm = TRUE), 
+            .groups = "drop")
+
+clust_long <- clust_means %>%
+  pivot_longer(-Cluster, names_to = "Descriptor", values_to = "Mean") %>%
+  group_by(Descriptor) %>%
+  mutate(z = scale(Mean)[,1]) %>%
+  ungroup()
+
+z_lim_c <- max(abs(clust_long$z))
+
+plotC <- ggplot(clust_long,
+                aes(factor(Descriptor, levels = descriptor_cols),
+                    factor(Cluster, levels = rev(valid_clusters)),
+                    fill = z)) +
+  geom_tile(colour = "grey85", linewidth = 0.25) +
+  scale_fill_gradient2(low = "navy", mid = "white", high = "firebrick",
+                       limits = c(-z_lim_c, z_lim_c), guide = "none") +
+  scale_y_discrete(labels = paste("Cl", rev(valid_clusters))) +
+  theme_bw(base_size = 12) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(face = "bold"),
+        panel.grid = element_blank())
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Panel D: Violin plots of Tanimoto distances
+# ──────────────────────────────────────────────────────────────────────────────
+# Calculate distances for labeled compounds (for comparison)
+lab_nn <- purrr::map_dfr(seq_along(apset), function(i) {
+  sims <- vapply(apset, function(fp) {
+    b1 <- apset[[i]]@bits
+    b2 <- fp@bits
+    inter <- length(intersect(b1, b2))
+    denom <- length(b1) + length(b2) - inter
+    if (denom == 0) 0 else inter / denom
+  }, numeric(1))
+  sims[i] <- -1
+  tibble(Distance = 1 - max(sims))
+}) %>%
+  mutate(Cluster = "Labeled")
+
+# Combine labeled and unknown distances
+violin_df <- bind_rows(
+  lab_nn,
+  unknown_df %>% select(Cluster, Distance)
+) %>%
+  mutate(Cluster = factor(Cluster, 
+                          levels = c("Labeled", as.character(valid_clusters))))
+
+# Count observations for labels
+n_cat <- table(violin_df$Cluster)
+
+plotD <- ggplot(violin_df, aes(Cluster, Distance, fill = Cluster)) +
+  geom_violin(trim = FALSE, alpha = 0.66, linewidth = 0.18, colour = NA) +
+  geom_boxplot(width = 0.12, outlier.shape = NA,
+               colour = "black", linewidth = 0.35, alpha = 0.92) +
+  geom_hline(yintercept = median(lab_nn$Distance),
+             linetype = "dashed", linewidth = 0.4, colour = "grey35") +
+  scale_fill_manual(values = c("Labeled" = "grey55", pal_clusters), 
+                    guide = "none") +
+  scale_x_discrete(labels = function(x) {
+    ifelse(x == "Labeled",
+           sprintf("Labeled\n(n=%d)", n_cat["Labeled"]),
+           sprintf("Cl %s\n(n=%d)", x, n_cat[x]))
+  }) +
+  labs(x = "Cluster (unknown counts)", y = "Tanimoto distance") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.35),
+        axis.title = element_text(face = "bold"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Assemble Figure 2 using patchwork
+# ──────────────────────────────────────────────────────────────────────────────
+figure2 <- (plotA | plotB) / (plotC | plotD) +
+  plot_layout(widths = c(1.45, 1), heights = c(1, 1)) +
+  plot_annotation(tag_levels = "A",
+                  theme = theme(plot.tag = element_text(face = "bold", size = 18)))
+
+# Save Figure 2
+ggsave("Figure_2.png",
+       figure2, width = 12, height = 9, dpi = 300)
+
+print("Figure 2 saved to results/Figure_2.png")
+
+# Display if in interactive session
+if (interactive()) {
+  print(figure2)
+}
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  if (!requireNamespace("ragg", quietly = TRUE)) install.packages("ragg")
+})
+
+# Helper: apply a consistent "publication" theme to any ggplot object
+pubify <- function(p, base_size_inc = 2){
+  p +
+    theme(
+      text               = element_text(size = 14 + base_size_inc, face = "bold"),
+      plot.title         = element_text(size = 18 + base_size_inc, face = "bold", hjust = 0.5),
+      axis.title         = element_text(size = 16 + base_size_inc, face = "bold"),
+      axis.text.x        = element_text(size = 13 + base_size_inc, face = "bold"),
+      axis.text.y        = element_text(size = 13 + base_size_inc, face = "bold"),
+      axis.ticks         = element_line(linewidth = 0.7),
+      legend.title       = element_text(size = 14 + base_size_inc, face = "bold"),
+      legend.text        = element_text(size = 13 + base_size_inc, face = "bold"),
+      panel.border       = element_rect(color = "black", linewidth = 0.6, fill = NA),
+      panel.grid.major   = element_line(linewidth = 0.35, colour = "grey85"),
+      panel.grid.minor   = element_blank()
+    )
+}
+
+# Strengthen Panel A tile borders & label sizes
+plotA <- plotA +
+  geom_tile(colour = "grey60", linewidth = 0.35) +
+  theme(
+    legend.key.width = unit(1.6, "cm"),
+    legend.key.height = unit(0.6, "cm"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 13, face = "bold"),
+    axis.text.y = element_text(size = 13, face = "bold")
+  )
+plotA <- pubify(plotA)
+
+# Panel B: bigger points & clearer cluster labels
+# Panel B: bigger points & clearer cluster labels
+plotB <- plotB +
+  geom_point(alpha = 0.45, size = 3.6) +
+  ggrepel::geom_text_repel(
+    data = centroids,  # Fixed: removed .env$
+    aes(label = label),
+    seed = 1, box.padding = 0.45, min.segment.length = 0.1,
+    size = 5.6, fontface = "bold", colour = "black", segment.color = NA,
+    max.overlaps = Inf
+  ) +
+  theme(
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text  = element_text(size = 13, face = "bold")
+  )
+plotB <- pubify(plotB)
+
+# Panel C: stronger tile borders and text
+plotC <- plotC +
+  geom_tile(colour = "grey55", linewidth = 0.35) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12, face = "bold"),
+    axis.text.y = element_text(size = 12, face = "bold")
+  )
+plotC <- pubify(plotC, base_size_inc = 1)
+
+# Panel D: thicker violins/boxes and bolder axis text
+plotD <- plotD +
+  geom_violin(trim = FALSE, alpha = 0.70, linewidth = 0.35, colour = "black") +
+  geom_boxplot(width = 0.12, outlier.shape = NA,
+               colour = "black", linewidth = 0.5, alpha = 0.95) +
+  theme(
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text  = element_text(size = 13, face = "bold")
+  )
+plotD <- pubify(plotD)
+
+# Reassemble with larger panel tags
+figure2 <- (plotA | plotB) / (plotC | plotD) +
+  plot_layout(widths = c(1.45, 1), heights = c(1, 1)) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(plot.tag = element_text(face = "bold", size = 22))
+  )
+
+# High-resolution, anti-aliased export (crisper text)
+ragg::agg_png("Figure_2.png", width = 12, height = 9, units = "in", res = 600)
+print(figure2)
+```
+
+
+```{r}
+# ──────────────────────────────────────────────────────────────────────────────
+# Toxicity Analysis by Cluster and FIX Status
+# This creates the toxicity figure showing Daphnia and Rat toxicity
+# ──────────────────────────────────────────────────────────────────────────────
+
+## Load required packages
+library(tidyverse)
+library(ggpubr)
+library(patchwork)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 1: Load toxicity data from EPA TEST
+# ──────────────────────────────────────────────────────────────────────────────
+tox_rat  <- get_data("Batch_Oral_rat_LD50_Consensus.csv")
+tox_daph <- get_data("Batch_Daphnia_magna_LC50_(48_hr)_AllMethods.csv")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 2: Create lookup table with SMILES, Cluster, and FIX status
+# ──────────────────────────────────────────────────────────────────────────────
+# Use known_df from Figure 2 code which has Cluster assignments
+lookup <- known_df %>%
+  select(smiles, Cluster, FIX) %>%
+  distinct()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3: Helper function to find the toxicity column
+# ──────────────────────────────────────────────────────────────────────────────
+find_log10_col <- function(df) {
+  # Find column with -log10 in the name that contains numeric data
+  cols <- grep("log10", names(df), ignore.case = TRUE, value = TRUE)
+  for (col in cols) {
+    if (any(!is.na(suppressWarnings(as.numeric(df[[col]]))))) {
+      return(sym(col))
+    }
+  }
+  stop("No numeric -log10 column found")
+}
+
+rat_col  <- find_log10_col(tox_rat)
+daph_col <- find_log10_col(tox_daph)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 4: Process toxicity data and join with cluster/FIX info
+# ──────────────────────────────────────────────────────────────────────────────
+# Process rat toxicity
+rat_data <- tox_rat %>%
+  mutate(
+    smiles = Query,
+    value = suppressWarnings(as.numeric(!!rat_col))
+  ) %>%
+  left_join(lookup, by = "smiles") %>%
+  filter(!is.na(value), !is.na(Cluster), !is.na(FIX)) %>%
+  mutate(
+    FIX = factor(FIX, levels = c(0, 1)),
+    Cluster = factor(Cluster)
+  )
+
+# Process daphnia toxicity
+daph_data <- tox_daph %>%
+  mutate(
+    smiles = Query,
+    value = suppressWarnings(as.numeric(!!daph_col))
+  ) %>%
+  left_join(lookup, by = "smiles") %>%
+  filter(!is.na(value), !is.na(Cluster), !is.na(FIX)) %>%
+  mutate(
+    FIX = factor(FIX, levels = c(0, 1)),
+    Cluster = factor(Cluster)
+  )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 5: Create toxicity plots function
+# ──────────────────────────────────────────────────────────────────────────────
+create_tox_plot <- function(data, title_text) {
+  # Only keep clusters that have both FIX=0 and FIX=1
+  clusters_with_both <- data %>%
+    group_by(Cluster) %>%
+    summarise(n_fix = n_distinct(FIX)) %>%
+    filter(n_fix == 2) %>%
+    pull(Cluster)
+  
+  plot_data <- data %>%
+    filter(Cluster %in% clusters_with_both)
+  
+  # Create plot
+  p <- ggplot(plot_data, aes(x = FIX, y = value, fill = FIX)) +
+    geom_violin(trim = FALSE, alpha = 0.66, colour = NA) +
+    geom_boxplot(width = 0.16, outlier.shape = NA, 
+                 linewidth = 0.3, alpha = 0.92, colour = "black") +
+    facet_wrap(~ Cluster, nrow = 1, scales = "free_y",
+               labeller = labeller(Cluster = function(x) paste("Cl", x))) +
+    stat_compare_means(method = "wilcox.test", 
+                       label = "p.format",
+                       size = 3.1, 
+                       label.y.npc = 0.96) +
+    scale_fill_manual(values = c("0" = "grey70", "1" = "grey30"), 
+                      guide = "none") +
+    labs(y = "-log10 (mol units)", 
+         x = NULL, 
+         title = title_text) +
+    theme_bw(base_size = 13) +
+    theme(
+      strip.background = element_rect(fill = "grey90", colour = "black"),
+      strip.text = element_text(face = "bold", size = 12),
+      axis.text.x = element_text(face = "bold", size = 11),
+      axis.text.y = element_text(size = 10),
+      axis.title.y = element_text(face = "bold", size = 12),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.3)
+    )
+  
+  return(p)
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 6: Create individual plots
+# ──────────────────────────────────────────────────────────────────────────────
+plotA_tox <- create_tox_plot(daph_data, "Daphnia LC50 | FIX 0 vs 1")
+plotB_tox <- create_tox_plot(rat_data, "Rat LD50 | FIX 0 vs 1")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 7: Combine plots using patchwork
+# ──────────────────────────────────────────────────────────────────────────────
+toxicity_figure <- plotA_tox / plotB_tox +
+  plot_annotation(tag_levels = "A",
+                  theme = theme(plot.tag = element_text(face = "bold", size = 16)))
+
+# Save the figure
+ggsave("Toxicity_by_Cluster_FIX.png",
+       toxicity_figure, 
+       width = 14, 
+       height = 7, 
+       dpi = 300)
+
+print("Toxicity figure saved to results/Toxicity_by_Cluster_FIX.png")
+
+# Display if in interactive session
+if (interactive()) {
+  print(toxicity_figure)
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional: Create summary statistics table
+# ──────────────────────────────────────────────────────────────────────────────
+tox_summary <- bind_rows(
+  rat_data %>% 
+    group_by(Cluster, FIX) %>%
+    summarise(
+      n = n(),
+      median = median(value, na.rm = TRUE),
+      IQR = IQR(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Endpoint = "Rat_LD50"),
+  
+  daph_data %>% 
+    group_by(Cluster, FIX) %>%
+    summarise(
+      n = n(),
+      median = median(value, na.rm = TRUE),
+      IQR = IQR(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Endpoint = "Daphnia_LC50")
+) %>%
+  arrange(Endpoint, Cluster, FIX)
+
+# Save summary statistics
+write_csv(tox_summary, 
+          here::here("results", "Toxicity_by_Cluster_Summary.csv"))
+
+print("Summary statistics saved to results/Toxicity_by_Cluster_Summary.csv")
+
+# Print summary to console
+print(tox_summary)
+```
+
+
+```{r}
+sessionInfo()
+```
